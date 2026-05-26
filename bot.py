@@ -34,8 +34,8 @@ STARTING_BALANCE   = 50.0
 BET_SIZE_PCT       = 0.05    # 5% of balance per trade
 MIN_EDGE_PCT       = 5.0     # Only bet when edge is 5%+
 SCAN_INTERVAL      = 30      # Check every 30 seconds
-MIN_TIME_REMAINING = 60      # Don't enter with less than 60s left
-MAX_TIME_REMAINING = 240     # Don't enter more than 4 mins before end
+MIN_TIME_REMAINING = 30      # Don't enter with less than 30s left
+MAX_TIME_REMAINING = 600     # Allow up to 10 minutes — wider window to catch markets
 
 # ─────────────────────────────────────────
 # PAPER TRADING STATE
@@ -108,9 +108,21 @@ async def get_btc_markets(session: aiohttp.ClientSession) -> list:
             btc_markets = []
             for m in markets:
                 q = (m.get("question", "") + m.get("description", "")).lower()
-                if ("bitcoin" in q or "btc" in q) and ("5" in q or "five" in q) and ("up" in q or "down" in q or "higher" in q or "lower" in q):
+                if ("bitcoin" in q or "btc" in q) and ("up" in q or "down" in q or "higher" in q or "lower" in q):
                     btc_markets.append(m)
+
             log.info(f"Found {len(btc_markets)} BTC markets")
+            # Debug — log each market so we can see what we're working with
+            for m in btc_markets:
+                end = m.get("endDate") or m.get("end_date_iso", "N/A")
+                now = datetime.now(timezone.utc)
+                try:
+                    end_dt = datetime.fromisoformat(end.replace("Z", "+00:00"))
+                    secs   = (end_dt - now).total_seconds()
+                    log.info(f"  -> {m.get('question','')[:60]} | ends in {secs:.0f}s | endDate: {end}")
+                except Exception:
+                    log.info(f"  -> {m.get('question','')[:60]} | endDate: {end}")
+
             return btc_markets
     except Exception as e:
         log.warning(f"Polymarket fetch error: {e}")
@@ -232,12 +244,11 @@ async def send_trade_alert(bot, trade, analysis, trader):
 _{analysis.get('reasoning', '')}._
 
 *Balance:* ${trader.balance:.2f} | *P&L:* {pnl_str}"""
-
     await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode=ParseMode.MARKDOWN)
 
 async def send_settlement_alert(bot, bet, profit, trader):
-    emoji   = "✅" if profit > 0 else "❌"
-    result  = "WON" if profit > 0 else "LOST"
+    emoji      = "✅" if profit > 0 else "❌"
+    result     = "WON" if profit > 0 else "LOST"
     profit_str = f"+${profit:.2f}" if profit >= 0 else f"-${abs(profit):.2f}"
     pnl_str    = f"+${trader.pnl:.2f}" if trader.pnl >= 0 else f"-${abs(trader.pnl):.2f}"
     msg = f"""{emoji} *TRADE SETTLED — {result}*
@@ -250,7 +261,6 @@ async def send_settlement_alert(bot, bet, profit, trader):
 *P&L:* {pnl_str}
 *Win Rate:* {trader.win_rate:.0f}%
 *Record:* {trader.wins}W / {trader.losses}L"""
-
     await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode=ParseMode.MARKDOWN)
 
 async def send_status(bot, trader, btc_price):
@@ -265,7 +275,6 @@ async def send_status(bot, trader, btc_price):
 *Trades:* {trader.wins + trader.losses} ({trader.wins}W / {trader.losses}L)
 *Open Bets:* {len(trader.open_bets)}
 *Time:* {datetime.now(timezone.utc).strftime('%H:%M UTC')}"""
-
     await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode=ParseMode.MARKDOWN)
 
 # ─────────────────────────────────────────
@@ -285,12 +294,15 @@ class PolyBot:
             return
         end_time = market.get("endDate") or market.get("end_date_iso", "")
         if not end_time:
+            log.info(f"No end time for market: {question[:50]}")
             return
         try:
             end_dt         = datetime.fromisoformat(end_time.replace("Z", "+00:00"))
             now            = datetime.now(timezone.utc)
             secs_remaining = (end_dt - now).total_seconds()
+            log.info(f"Market time check: {secs_remaining:.0f}s remaining (min:{MIN_TIME_REMAINING} max:{MAX_TIME_REMAINING})")
             if secs_remaining < MIN_TIME_REMAINING or secs_remaining > MAX_TIME_REMAINING:
+                log.info(f"Skipping — outside time window")
                 return
             btc_price = await get_btc_price(session)
             if not btc_price:
@@ -393,10 +405,9 @@ class PolyBot:
         log.info("Polymarket Paper Trading Bot starting...")
         await self.bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
-            text=f"🤖 *Polymarket Paper Trader Online*\nBalance: ${self.trader.balance:.2f} | Min edge: {MIN_EDGE_PCT}% | Bet size: {BET_SIZE_PCT*100:.0f}%\nWatching BTC 5-min up/down markets...",
+            text=f"🤖 *Polymarket Paper Trader Online*\nBalance: ${self.trader.balance:.2f} | Min edge: {MIN_EDGE_PCT}% | Bet size: {BET_SIZE_PCT*100:.0f}%\nWatching BTC markets...",
             parse_mode=ParseMode.MARKDOWN
         )
-
         async with aiohttp.ClientSession() as session:
             while True:
                 try:
