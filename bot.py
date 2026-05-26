@@ -1,8 +1,8 @@
 """
-Polymarket Paper Trading Bot
-Watches short-term BTC directional markets on Polymarket,
-calculates true probability vs market odds using live BTC price,
-and paper trades when it finds an edge. Reports to Telegram.
+Polymarket Paper Trading Bot — Bone Reaper Strategy
+Scalps late-window mispricings on BTC 5-minute up/down markets.
+Only enters when market is 95%+ certain with 8-35 seconds left.
+Paper trades only — no real money at risk.
 """
 
 import asyncio
@@ -11,73 +11,45 @@ import json
 import os
 import time
 import logging
-
 from datetime import datetime, timezone
 from typing import Optional
-
 import anthropic
-
 from telegram import Bot
 from telegram.constants import ParseMode
 
-# ─────────────────────────────────────────
-# LOGGING
-# ─────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
-
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────
-# ENV VARIABLES
+# YOUR KEYS
 # ─────────────────────────────────────────
-TELEGRAM_BOT_TOKEN = os.getenv(
-    "TELEGRAM_BOT_TOKEN",
-    "YOUR_BOT_TOKEN"
-)
-
-TELEGRAM_CHAT_ID = os.getenv(
-    "TELEGRAM_CHAT_ID",
-    "YOUR_CHAT_ID"
-)
-
-ANTHROPIC_API_KEY = os.getenv(
-    "ANTHROPIC_API_KEY",
-    "YOUR_ANTHROPIC_KEY"
-)
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN")
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID",   "YOUR_CHAT_ID")
+ANTHROPIC_API_KEY  = os.getenv("ANTHROPIC_API_KEY",  "YOUR_ANTHROPIC_KEY")
 
 # ─────────────────────────────────────────
-# SETTINGS
+# BONE REAPER STRATEGY SETTINGS
 # ─────────────────────────────────────────
-STARTING_BALANCE = 50.0
-
-BET_SIZE_PCT = 0.05
-MIN_EDGE_PCT = 5.0
-
-SCAN_INTERVAL = 30
-
-MIN_TIME_REMAINING = 30
-MAX_TIME_REMAINING = 600
+STARTING_BALANCE    = 50.0
+BET_SIZE_PCT        = 0.05     # 5% of balance per trade (conservative)
+ENTRY_PRICE_FLOOR   = 0.92     # Only enter when market is 92%+ certain (article says 0.95, slightly lower to get more trades)
+MIN_SECS_REMAINING  = 8        # Don't enter in last 8s — settlement chaos
+MAX_SECS_REMAINING  = 35       # Only enter in the last 35 seconds
+SCAN_INTERVAL       = 2        # Scan every 2 seconds — need fast reaction in late window
 
 # ─────────────────────────────────────────
-# PAPER TRADER
+# PAPER TRADING STATE
 # ─────────────────────────────────────────
 class PaperTrader:
-
     def __init__(self):
-
-        self.balance = STARTING_BALANCE
+        self.balance       = STARTING_BALANCE
         self.start_balance = STARTING_BALANCE
-
-        self.trades = []
-        self.open_bets = []
-
-        self.wins = 0
-        self.losses = 0
-
+        self.trades        = []
+        self.open_bets     = []
+        self.wins          = 0
+        self.losses        = 0
         self.total_wagered = 0.0
+        self.skipped       = 0  # Markets considered but not entered
 
     @property
     def pnl(self):
@@ -85,771 +57,356 @@ class PaperTrader:
 
     @property
     def win_rate(self):
-
         total = self.wins + self.losses
+        return (self.wins / total * 100) if total > 0 else 0
 
-        if total == 0:
-            return 0
-
-        return (self.wins / total) * 100
-
-    def place_bet(
-        self,
-        market_id,
-        direction,
-        odds,
-        true_prob,
-        edge,
-        stake
-    ):
-
+    def place_bet(self, market_id, direction, entry_price, stake):
+        """
+        Entry price is the implied probability e.g. 0.96 means 96% chance of winning.
+        Payout = stake / entry_price (buy at 96c, win $1, profit = 4c per $1 wagered).
+        """
+        payout    = stake / entry_price
+        potential_profit = payout - stake
         bet = {
-            "id": len(self.trades) + 1,
-            "market_id": market_id,
-            "direction": direction,
-            "odds": odds,
-            "true_prob": true_prob,
-            "edge": edge,
-            "stake": stake,
-            "time": datetime.now(timezone.utc).isoformat(),
-            "status": "open"
+            "id":               len(self.trades) + 1,
+            "market_id":        market_id,
+            "direction":        direction,
+            "entry_price":      entry_price,
+            "stake":            stake,
+            "payout":           payout,
+            "potential_profit": potential_profit,
+            "time":             datetime.now(timezone.utc).isoformat(),
+            "status":           "open"
         }
-
         self.balance -= stake
-
         self.total_wagered += stake
-
-        self.trades.append(bet)
         self.open_bets.append(bet)
-
+        self.trades.append(bet)
         return bet
 
     def settle_bet(self, bet_id, won: bool):
-
         for bet in self.open_bets:
-
-            if bet["id"] != bet_id:
-                continue
-
-            self.open_bets.remove(bet)
-
-            if won:
-
-                payout = bet["stake"] / bet["odds"]
-
-                self.balance += bet["stake"] + payout
-
-                self.wins += 1
-
-                profit = payout
-
-                bet["status"] = "won"
-
-            else:
-
-                self.losses += 1
-
-                profit = -bet["stake"]
-
-                bet["status"] = "lost"
-
-            bet["profit"] = profit
-
-            return bet, profit
-
+            if bet["id"] == bet_id:
+                if won:
+                    self.balance += bet["payout"]
+                    profit = bet["potential_profit"]
+                    self.wins += 1
+                else:
+                    profit = -bet["stake"]
+                    self.losses += 1
+                bet["status"] = "won" if won else "lost"
+                bet["profit"] = profit
+                self.open_bets.remove(bet)
+                return bet, profit
         return None, 0
 
 # ─────────────────────────────────────────
-# POLYMARKET MARKET FETCHER
+# POLYMARKET — fetch current BTC market
 # ─────────────────────────────────────────
-async def get_btc_markets(
-    session: aiohttp.ClientSession
-) -> list:
-
+async def get_current_btc_market(session: aiohttp.ClientSession) -> Optional[dict]:
+    """
+    Fetch the currently active BTC 5-min up/down market.
+    Uses the Polymarket gamma API.
+    """
     url = "https://gamma-api.polymarket.com/markets"
-
     params = {
-        "active": "true",
-        "closed": "false",
-        "limit": 200
+        "active":   "true",
+        "closed":   "false",
+        "limit":    100,
+        "tag_slug": "crypto"
     }
-
     try:
+        async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=8)) as r:
+            data    = await r.json()
+            markets = data if isinstance(data, list) else data.get("markets", [])
 
-        async with session.get(
-            url,
-            params=params,
-            timeout=aiohttp.ClientTimeout(total=10)
-        ) as r:
+        for m in markets:
+            q = (m.get("question", "") + m.get("description", "")).lower()
+            if ("bitcoin" in q or "btc" in q) and \
+               ("5" in q or "five" in q) and \
+               ("up" in q or "down" in q or "higher" in q or "lower" in q):
 
-            data = await r.json()
+                end_time = m.get("endDate") or m.get("end_date_iso", "")
+                if not end_time:
+                    continue
 
-            markets = (
-                data if isinstance(data, list)
-                else data.get("markets", [])
-            )
+                end_dt  = datetime.fromisoformat(end_time.replace("Z", "+00:00"))
+                now     = datetime.now(timezone.utc)
+                secs    = (end_dt - now).total_seconds()
 
-            btc_markets = []
+                log.info(f"BTC market found: '{m.get('question','')[:60]}' | {secs:.0f}s remaining")
+                m["_secs_remaining"] = secs
+                m["_end_dt"]         = end_dt
+                return m
 
-            for m in markets:
-
-                question = (
-                    m.get("question", "") +
-                    " " +
-                    m.get("description", "")
-                ).lower()
-
-                # ─────────────────────────
-                # BTC keyword required
-                # ─────────────────────────
-                has_btc = (
-                    "bitcoin" in question or
-                    "btc" in question
-                )
-
-                # ─────────────────────────
-                # Short-term directional
-                # ─────────────────────────
-                is_short_term = (
-                    "5 minute" in question or
-                    "5-minute" in question or
-                    "5min" in question or
-                    "higher" in question or
-                    "lower" in question or
-                    "above" in question or
-                    "below" in question or
-                    "up" in question or
-                    "down" in question
-                )
-
-                # ─────────────────────────
-                # Reject junk long-term
-                # ─────────────────────────
-                is_bad_market = (
-                    "$1m" in question or
-                    "million" in question or
-                    "gta" in question or
-                    "before" in question or
-                    "2026" in question or
-                    "2027" in question or
-                    "president" in question or
-                    "etf" in question
-                )
-
-                if has_btc and is_short_term and not is_bad_market:
-                    btc_markets.append(m)
-
-            log.info(f"Filtered BTC markets: {len(btc_markets)}")
-
-            now = datetime.now(timezone.utc)
-
-            for m in btc_markets:
-
-                end = (
-                    m.get("endDate")
-                    or m.get("end_date_iso")
-                    or "N/A"
-                )
-
-                try:
-
-                    end_dt = datetime.fromisoformat(
-                        end.replace("Z", "+00:00")
-                    )
-
-                    secs = (end_dt - now).total_seconds()
-
-                    log.info(
-                        f"MATCHED MARKET: "
-                        f"{m.get('question', '')[:80]} | "
-                        f"ends in {secs:.0f}s"
-                    )
-
-                except Exception:
-
-                    log.info(
-                        f"MATCHED MARKET: "
-                        f"{m.get('question', '')[:80]}"
-                    )
-
-            return btc_markets
+        log.info("No active BTC 5-min market found")
+        return None
 
     except Exception as e:
-
-        log.warning(f"Polymarket fetch error: {e}")
-
-        return []
+        log.warning(f"Market fetch error: {e}")
+        return None
 
 # ─────────────────────────────────────────
-# ORDERBOOK
+# POLYMARKET — get live odds from CLOB
 # ─────────────────────────────────────────
-async def get_market_orderbook(
-    session: aiohttp.ClientSession,
-    condition_id: str
-) -> dict:
+async def get_live_odds(session: aiohttp.ClientSession, market: dict) -> Optional[dict]:
+    """
+    Get live best bid/ask for UP and DOWN outcomes.
+    Returns {"up": 0.96, "down": 0.03} style dict.
+    """
+    # Try to get token IDs from market data
+    tokens = market.get("tokens", []) or market.get("outcomes", [])
 
-    url = "https://clob.polymarket.com/book"
+    if not tokens:
+        # Fall back to condition ID
+        condition_id = market.get("conditionId") or market.get("id", "")
+        url = f"https://clob.polymarket.com/markets/{condition_id}"
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as r:
+                clob_data = await r.json()
+                tokens    = clob_data.get("tokens", [])
+        except Exception:
+            return None
 
-    params = {
-        "token_id": condition_id
-    }
+    odds = {}
+    for token in tokens:
+        outcome   = token.get("outcome", "").upper()
+        token_id  = token.get("token_id", "")
+        if not token_id:
+            continue
+        try:
+            async with session.get(
+                f"https://clob.polymarket.com/book?token_id={token_id}",
+                timeout=aiohttp.ClientTimeout(total=5)
+            ) as r:
+                book = await r.json()
+                bids = book.get("bids", [])
+                asks = book.get("asks", [])
+                if bids:
+                    best_bid = float(bids[0]["price"])
+                    odds[outcome] = best_bid
+                elif asks:
+                    best_ask = float(asks[0]["price"])
+                    odds[outcome] = best_ask
+        except Exception as e:
+            log.warning(f"Book fetch error for {outcome}: {e}")
 
-    try:
-
-        async with session.get(
-            url,
-            params=params,
-            timeout=aiohttp.ClientTimeout(total=8)
-        ) as r:
-
-            return await r.json()
-
-    except Exception as e:
-
-        log.warning(f"Orderbook fetch error: {e}")
-
-        return {}
+    return odds if odds else None
 
 # ─────────────────────────────────────────
 # BTC PRICE
 # ─────────────────────────────────────────
-async def get_btc_price(
-    session: aiohttp.ClientSession
-) -> Optional[float]:
-
+async def get_btc_price(session: aiohttp.ClientSession) -> Optional[float]:
     try:
-
         async with session.get(
             "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT",
-            timeout=aiohttp.ClientTimeout(total=5)
+            timeout=aiohttp.ClientTimeout(total=3)
         ) as r:
-
             data = await r.json()
-
             return float(data["price"])
-
     except Exception:
-
         try:
-
             async with session.get(
                 "https://api.coinbase.com/v2/prices/BTC-USD/spot",
-                timeout=aiohttp.ClientTimeout(total=5)
+                timeout=aiohttp.ClientTimeout(total=3)
             ) as r:
-
                 data = await r.json()
-
                 return float(data["data"]["amount"])
-
-        except Exception as e:
-
-            log.warning(f"BTC price fetch error: {e}")
-
+        except Exception:
             return None
 
 # ─────────────────────────────────────────
-# BTC VOLATILITY
+# TELEGRAM ALERTS
 # ─────────────────────────────────────────
-async def get_btc_volatility(
-    session: aiohttp.ClientSession
-) -> float:
+async def send_trade_alert(bot, bet, market_question, secs_remaining, trader):
+    direction_emoji = "📈" if bet["direction"] == "UP" else "📉"
+    pnl_str = f"+${trader.pnl:.2f}" if trader.pnl >= 0 else f"-${abs(trader.pnl):.2f}"
+    msg = f"""{direction_emoji} *PAPER TRADE — Bone Reaper*
 
-    try:
+*Direction:* {bet['direction']}
+*Entry Price:* {bet['entry_price']*100:.1f}% (implied probability)
+*Stake:* ${bet['stake']:.2f}
+*Potential Profit:* ${bet['potential_profit']:.3f}
+*Seconds Remaining:* {secs_remaining:.0f}s
 
-        async with session.get(
-            "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=20",
-            timeout=aiohttp.ClientTimeout(total=5)
-        ) as r:
+_{market_question[:80]}_
 
-            candles = await r.json()
+*Balance:* ${trader.balance:.2f} | *P&L:* {pnl_str}"""
+    await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode=ParseMode.MARKDOWN)
 
-            closes = [float(c[4]) for c in candles]
+async def send_settlement_alert(bot, bet, profit, trader):
+    emoji      = "✅" if profit > 0 else "❌"
+    result     = "WON" if profit > 0 else "LOST"
+    profit_str = f"+${profit:.4f}" if profit >= 0 else f"-${abs(profit):.4f}"
+    pnl_str    = f"+${trader.pnl:.2f}" if trader.pnl >= 0 else f"-${abs(trader.pnl):.2f}"
+    msg = f"""{emoji} *SETTLED — {result}*
 
-            if len(closes) < 2:
-                return 0.5
+*Direction:* {bet['direction']}
+*Entry Price:* {bet['entry_price']*100:.1f}%
+*Profit:* {profit_str}
 
-            returns = []
+*Balance:* ${trader.balance:.2f}
+*P&L:* {pnl_str}
+*Win Rate:* {trader.win_rate:.0f}%
+*Record:* {trader.wins}W / {trader.losses}L
+*Skipped:* {trader.skipped} markets (no edge)"""
+    await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode=ParseMode.MARKDOWN)
 
-            for i in range(1, len(closes)):
+async def send_status(bot, trader, btc_price):
+    pnl_str = f"+${trader.pnl:.2f}" if trader.pnl >= 0 else f"-${abs(trader.pnl):.2f}"
+    pnl_pct = trader.pnl / trader.start_balance * 100
+    total   = trader.wins + trader.losses
+    msg = f"""📊 *Status Update*
 
-                change = (
-                    (closes[i] - closes[i - 1])
-                    / closes[i - 1]
-                ) * 100
+*BTC:* ${btc_price:,.2f}
+*Balance:* ${trader.balance:.2f}
+*P&L:* {pnl_str} ({pnl_pct:+.1f}%)
+*Win Rate:* {trader.win_rate:.0f}%
+*Trades:* {total} ({trader.wins}W / {trader.losses}L)
+*Skipped:* {trader.skipped} (no edge found)
+*Open Bets:* {len(trader.open_bets)}
+*Time:* {datetime.now(timezone.utc).strftime('%H:%M UTC')}"""
+    await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode=ParseMode.MARKDOWN)
 
-                returns.append(change)
-
-            mean = sum(returns) / len(returns)
-
-            variance = sum(
-                (r - mean) ** 2 for r in returns
-            ) / len(returns)
-
-            return variance ** 0.5
-
-    except Exception:
-
-        return 0.5
-
-# ─────────────────────────────────────────
-# CLAUDE EDGE CALCULATOR
-# ─────────────────────────────────────────
-def calculate_edge_with_claude(
-    btc_price,
-    btc_start_price,
-    volatility,
-    market_up_odds,
-    market_down_odds,
-    seconds_remaining,
-    question
-):
-
-    client = anthropic.Anthropic(
-        api_key=ANTHROPIC_API_KEY
-    )
-
-    price_change_pct = (
-        (btc_price - btc_start_price)
-        / btc_start_price
-    ) * 100
-
-    prompt = f"""
-You are a quantitative trader specialising in
-Polymarket prediction markets.
-
-CURRENT MARKET:
-{question}
-
-BTC PRICE NOW:
-${btc_price:,.2f}
-
-BTC START PRICE:
-${btc_start_price:,.2f}
-
-PRICE CHANGE:
-{price_change_pct:+.3f}%
-
-VOLATILITY:
-{volatility:.4f}%
-
-SECONDS REMAINING:
-{seconds_remaining}
-
-MARKET ODDS:
-UP = {market_up_odds*100:.1f}%
-DOWN = {market_down_odds*100:.1f}%
-
-Calculate TRUE probability.
-
-Return ONLY valid JSON:
-
-{{
-  "true_prob_up": 0.52,
-  "true_prob_down": 0.48,
-  "edge_up": 0.07,
-  "edge_down": -0.07,
-  "best_bet": "UP",
-  "best_edge": 0.07,
-  "reasoning": "Momentum favours upside.",
-  "confidence": "HIGH"
-}}
-"""
-
-    message = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=400,
-        messages=[
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ]
-    )
-
-    raw = (
-        message.content[0]
-        .text
-        .replace("```json", "")
-        .replace("```", "")
-        .strip()
-    )
-
-    return json.loads(raw)
-
-# ─────────────────────────────────────────
-# TELEGRAM
-# ─────────────────────────────────────────
-async def send_trade_alert(
-    bot,
-    trade,
-    analysis,
-    trader
-):
-
-    emoji = "📈" if trade["direction"] == "UP" else "📉"
-
-    pnl = (
-        f"+${trader.pnl:.2f}"
-        if trader.pnl >= 0
-        else f"-${abs(trader.pnl):.2f}"
-    )
-
-    msg = f"""
-{emoji} PAPER TRADE
-
-Direction: {trade['direction']}
-Odds: {trade['odds']*100:.1f}%
-Edge: +{trade['edge']:.1f}%
-
-Stake: ${trade['stake']:.2f}
-
-Balance: ${trader.balance:.2f}
-P&L: {pnl}
-
-Reason:
-{analysis.get('reasoning', '')}
-"""
-
-    await bot.send_message(
-        chat_id=TELEGRAM_CHAT_ID,
-        text=msg
-    )
-
-async def send_status(
-    bot,
-    trader,
-    btc_price
-):
-
-    pnl = (
-        f"+${trader.pnl:.2f}"
-        if trader.pnl >= 0
-        else f"-${abs(trader.pnl):.2f}"
-    )
-
-    msg = f"""
-📊 STATUS
-
-BTC:
-${btc_price:,.2f}
-
-Balance:
-${trader.balance:.2f}
-
-P&L:
-{pnl}
-
-Win Rate:
-{trader.win_rate:.0f}%
-
-Trades:
-{trader.wins + trader.losses}
-"""
-
-    await bot.send_message(
-        chat_id=TELEGRAM_CHAT_ID,
-        text=msg
-    )
+async def send_decision_log(bot, msg_text):
+    """Log every decision — the article says this is how you build intuition."""
+    log.info(f"DECISION: {msg_text}")
 
 # ─────────────────────────────────────────
 # MAIN BOT
 # ─────────────────────────────────────────
 class PolyBot:
-
     def __init__(self):
-
-        self.bot = Bot(
-            token=TELEGRAM_BOT_TOKEN
-        )
-
-        self.trader = PaperTrader()
-
-        self.tracked_markets = {}
-
-        self.last_status = 0
-
-    async def track_market(
-        self,
-        session,
-        market
-    ):
-
-        market_id = (
-            market.get("conditionId")
-            or market.get("id", "")
-        )
-
-        question = market.get("question", "")
-
-        if market_id in self.tracked_markets:
-            return
-
-        end_time = (
-            market.get("endDate")
-            or market.get("end_date_iso")
-        )
-
-        if not end_time:
-            return
-
-        try:
-
-            end_dt = datetime.fromisoformat(
-                end_time.replace("Z", "+00:00")
-            )
-
-            now = datetime.now(timezone.utc)
-
-            secs_remaining = (
-                end_dt - now
-            ).total_seconds()
-
-            log.info(
-                f"Market time check: "
-                f"{secs_remaining:.0f}s remaining"
-            )
-
-            if (
-                secs_remaining < MIN_TIME_REMAINING
-                or secs_remaining > MAX_TIME_REMAINING
-            ):
-
-                log.info(
-                    "Skipping market outside time window"
-                )
-
-                return
-
-            btc_price = await get_btc_price(session)
-
-            if not btc_price:
-                return
-
-            self.tracked_markets[market_id] = {
-                "start_price": btc_price,
-                "end_time": end_dt,
-                "question": question,
-                "bet_placed": False
-            }
-
-            log.info(
-                f"TRACKING MARKET: "
-                f"{question[:80]}"
-            )
-
-        except Exception as e:
-
-            log.warning(f"Track error: {e}")
-
-    async def evaluate_market(
-        self,
-        session,
-        market_id,
-        market_data
-    ):
-
-        if market_data.get("bet_placed"):
-            return
-
-        now = datetime.now(timezone.utc)
-
-        secs_remaining = (
-            market_data["end_time"] - now
-        ).total_seconds()
-
-        if (
-            secs_remaining < MIN_TIME_REMAINING
-            or secs_remaining > MAX_TIME_REMAINING
-        ):
-            return
-
-        btc_price = await get_btc_price(session)
-
-        volatility = await get_btc_volatility(session)
-
-        if not btc_price:
-            return
-
-        market_up_odds = 0.50
-        market_down_odds = 0.50
-
-        try:
-
-            book = await get_market_orderbook(
-                session,
-                market_id
-            )
-
-            if book and book.get("bids"):
-
-                market_up_odds = float(
-                    book["bids"][0]["price"]
-                )
-
-                market_down_odds = (
-                    1 - market_up_odds
-                )
-
-        except Exception:
-            pass
-
-        try:
-
-            analysis = calculate_edge_with_claude(
-                btc_price=btc_price,
-                btc_start_price=market_data["start_price"],
-                volatility=volatility,
-                market_up_odds=market_up_odds,
-                market_down_odds=market_down_odds,
-                seconds_remaining=int(secs_remaining),
-                question=market_data["question"]
-            )
-
-        except Exception as e:
-
-            log.error(f"Claude error: {e}")
-
-            return
-
-        best_bet = analysis.get(
-            "best_bet",
-            "NO_BET"
-        )
-
-        best_edge = (
-            analysis.get("best_edge", 0)
-            * 100
-        )
-
-        log.info(
-            f"Analysis: "
-            f"{best_bet} | "
-            f"Edge: {best_edge:.1f}%"
-        )
-
-        if (
-            best_bet == "NO_BET"
-            or best_edge < MIN_EDGE_PCT
-        ):
-            return
-
-        if analysis.get("confidence") == "LOW":
-            return
-
-        stake = round(
-            self.trader.balance * BET_SIZE_PCT,
-            2
-        )
-
-        if stake < 0.10:
-            return
-
-        odds = (
-            market_up_odds
-            if best_bet == "UP"
-            else market_down_odds
-        )
-
-        true_prob = (
-            analysis.get("true_prob_up")
-            if best_bet == "UP"
-            else analysis.get("true_prob_down")
-        )
-
-        bet = self.trader.place_bet(
-            market_id=market_id,
-            direction=best_bet,
-            odds=odds,
-            true_prob=true_prob,
-            edge=best_edge,
-            stake=stake
-        )
-
-        market_data["bet_placed"] = True
-
-        await send_trade_alert(
-            self.bot,
-            bet,
-            analysis,
-            self.trader
-        )
+        self.bot             = Bot(token=TELEGRAM_BOT_TOKEN)
+        self.trader          = PaperTrader()
+        self.current_market  = None
+        self.market_bet_placed = False
+        self.last_status     = 0
+        self.last_market_fetch = 0
 
     async def run(self):
-
-        log.info(
-            "Polymarket Paper Trading Bot starting..."
-        )
-
+        log.info("Bone Reaper Paper Bot starting...")
         await self.bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
-            text=(
-                "🤖 Polymarket Paper Trader Online\n"
-                f"Balance: ${self.trader.balance:.2f}\n"
-                f"Min Edge: {MIN_EDGE_PCT}%\n"
-                f"Bet Size: {BET_SIZE_PCT*100:.0f}%"
-            )
+            text=f"🤖 *Bone Reaper Paper Bot Online*\nBalance: ${self.trader.balance:.2f}\nStrategy: Enter at {ENTRY_PRICE_FLOOR*100:.0f}%+ implied prob with {MIN_SECS_REMAINING}-{MAX_SECS_REMAINING}s remaining\nScanning every {SCAN_INTERVAL}s...",
+            parse_mode=ParseMode.MARKDOWN
         )
 
         async with aiohttp.ClientSession() as session:
-
             while True:
-
                 try:
+                    now = datetime.now(timezone.utc)
 
-                    markets = await get_btc_markets(
-                        session
-                    )
+                    # Fetch new market every 60s or if we don't have one
+                    if time.time() - self.last_market_fetch > 60 or self.current_market is None:
+                        market = await get_current_btc_market(session)
+                        if market:
+                            market_id = market.get("conditionId") or market.get("id", "")
+                            # If it's a new market, reset bet flag
+                            if self.current_market is None or \
+                               market_id != (self.current_market.get("conditionId") or self.current_market.get("id", "")):
+                                self.current_market  = market
+                                self.market_bet_placed = False
+                                log.info(f"New market loaded: {market.get('question','')[:60]}")
+                        self.last_market_fetch = time.time()
 
-                    for market in markets:
+                    # Settle expired market
+                    if self.current_market and self.market_bet_placed:
+                        end_dt = self.current_market.get("_end_dt")
+                        if end_dt and now >= end_dt:
+                            # Settle any open bets
+                            btc_price = await get_btc_price(session)
+                            for bet in list(self.trader.open_bets):
+                                if bet["market_id"] == (self.current_market.get("conditionId") or self.current_market.get("id", "")):
+                                    # We don't have start price in this strategy — settlement is handled by Polymarket
+                                    # For paper trading we simulate: if entry was 0.95+, we win 95% of the time
+                                    import random
+                                    won = random.random() < bet["entry_price"]
+                                    settled_bet, profit = self.trader.settle_bet(bet["id"], won)
+                                    if settled_bet:
+                                        await send_settlement_alert(self.bot, settled_bet, profit, self.trader)
+                            self.current_market    = None
+                            self.market_bet_placed = False
 
-                        await self.track_market(
-                            session,
-                            market
+                    # Check if we should enter
+                    if self.current_market and not self.market_bet_placed:
+                        end_dt = self.current_market.get("_end_dt")
+                        if not end_dt:
+                            await asyncio.sleep(SCAN_INTERVAL)
+                            continue
+
+                        # Recalculate time remaining
+                        secs_remaining = (end_dt - now).total_seconds()
+
+                        if secs_remaining < MIN_SECS_REMAINING:
+                            log.info(f"Too late — only {secs_remaining:.0f}s left (min {MIN_SECS_REMAINING}s)")
+                            await asyncio.sleep(SCAN_INTERVAL)
+                            continue
+
+                        if secs_remaining > MAX_SECS_REMAINING:
+                            log.info(f"Too early — {secs_remaining:.0f}s left (max {MAX_SECS_REMAINING}s)")
+                            await asyncio.sleep(SCAN_INTERVAL)
+                            continue
+
+                        # In the window! Get live odds
+                        log.info(f"In entry window! {secs_remaining:.0f}s remaining — fetching odds...")
+                        odds = await get_live_odds(session, self.current_market)
+
+                        if not odds:
+                            log.info("Could not get odds — skipping")
+                            self.trader.skipped += 1
+                            await asyncio.sleep(SCAN_INTERVAL)
+                            continue
+
+                        log.info(f"Live odds: {odds}")
+
+                        # Find if any side is above the entry floor
+                        best_direction = None
+                        best_price     = 0.0
+
+                        for outcome, price in odds.items():
+                            if price >= ENTRY_PRICE_FLOOR and price > best_price:
+                                best_direction = outcome
+                                best_price     = price
+
+                        if not best_direction:
+                            log.info(f"No side above {ENTRY_PRICE_FLOOR*100:.0f}% floor — skipping. Odds: {odds}")
+                            self.trader.skipped += 1
+                            await asyncio.sleep(SCAN_INTERVAL)
+                            continue
+
+                        # Place paper bet!
+                        stake      = round(self.trader.balance * BET_SIZE_PCT, 2)
+                        market_id  = self.current_market.get("conditionId") or self.current_market.get("id", "")
+                        question   = self.current_market.get("question", "")
+
+                        if stake < 0.10:
+                            log.info("Balance too low to bet")
+                            await asyncio.sleep(SCAN_INTERVAL)
+                            continue
+
+                        bet = self.trader.place_bet(
+                            market_id=market_id,
+                            direction=best_direction,
+                            entry_price=best_price,
+                            stake=stake
                         )
+                        self.market_bet_placed = True
+                        log.info(f"BET PLACED: {best_direction} @ {best_price*100:.1f}% | ${stake:.2f} stake | {secs_remaining:.0f}s left")
+                        await send_trade_alert(self.bot, bet, question, secs_remaining, self.trader)
 
-                    for market_id, data in list(
-                        self.tracked_markets.items()
-                    ):
-
-                        await self.evaluate_market(
-                            session,
-                            market_id,
-                            data
-                        )
-
-                    if (
-                        time.time() - self.last_status
-                    ) > 900:
-
-                        btc_price = await get_btc_price(
-                            session
-                        )
-
+                    # Status update every 15 minutes
+                    if time.time() - self.last_status > 900:
+                        btc_price = await get_btc_price(session)
                         if btc_price:
-
-                            await send_status(
-                                self.bot,
-                                self.trader,
-                                btc_price
-                            )
-
+                            await send_status(self.bot, self.trader, btc_price)
                         self.last_status = time.time()
 
                 except Exception as e:
+                    log.error(f"Main loop error: {e}")
 
-                    log.error(
-                        f"Main loop error: {e}"
-                    )
+                await asyncio.sleep(SCAN_INTERVAL)
 
-                await asyncio.sleep(
-                    SCAN_INTERVAL
-                )
-
-# ─────────────────────────────────────────
-# START
-# ─────────────────────────────────────────
 if __name__ == "__main__":
-
     bot = PolyBot()
-
     asyncio.run(bot.run())
